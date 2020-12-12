@@ -16,15 +16,15 @@
  * =====================================================================================
  */
 
+#ifndef ROBOT_HPP
+#define ROBOT_HPP
 
 #include <stdlib.h>
 #include <vector>
 
-#include "rob_mat.hpp"
 #include "invkin.hpp"
-
-using namespace Eigen;
-
+#include "link.hpp"
+#include "joint.hpp"
 
 struct{
 	Vector3f kinvek;
@@ -32,147 +32,96 @@ struct{
 	double _mass;
 } typedef LinkConf;
 
-
-
-class RevoluteJoint{
-
-	/*
-	 *  A joint which only can rotate around its axis.
-	 */
-
-	private:
-		SE3mat _g, _g_global, _g_initial;
-		Vector3f _pos;
-
-	public:
-		UnitScrew s_unit;
-		int joint_nr;
-		float angle;
-		Vector3f rot;
-
-		RevoluteJoint(int nr) : 
-			joint_nr{nr},
-			s_unit(),
-			_g(), 
-			_g_global(),
-			_pos(),
-			angle{0},
-			_g_initial(),
-			rot(0.0f, 0.0f, 0.0)
-		{
-			_pos.setZero();
-		}
-
-		RevoluteJoint(int nr, Vector3f rot_vec, Vector3f q) : 
-			joint_nr{nr},
-			s_unit(),
-			_g(), 
-			_g_global(),
-			_pos(q),
-			_g_initial(q),
-			angle{0},
-			rot(rot_vec)
-		{
-			s_unit.set_from_revolute_axis(rot, q);
-		}
-
-		SE3mat transform(float angle){
-		     return s_unit.exp(angle);
-		}
-
-		void set_transform(float angle){
-			this-> angle = angle;
-		     _g = s_unit.exp(angle);
-		}
-
-		SE3mat g(){
-			return _g;
-		}
-
-		Matrix4f get_transform(){
-			// legacy...
-			return _g.to_mat4();
-		}
-
-		void set_global_transform(SE3mat g){
-			_g_global = g;
-		}
-
-		Vector3f get_pos(){
-			return _g_global * _pos;
-
-		}
-
-		Vector3f get_pos_raw(){
-			return _pos;
-		}
-
-		Matrix4f get_global_transform(){
-			return _g_global.to_mat4();
-		}
-
-		SE3mat get_SE3_pos(){
-			return _g_global * _g_initial;
-		}
-
-};
-
-class Link 
+class BaseRobot
 {
 
-	/*  
-	 * Link i connects joint i-1 and i
-	 * joint i-1 is considered to be the "parent"
-	 * joint i is the child, which it holds a r
-	 *  
-	 * A link has an angle? Which is the angle of the child.
-	 * A link has a pos, which is the vector from child to parent coordinate frame.
-	 *
-	 */
-
-	public:
-		int link_nr;
-		float mass;
-		RevoluteJoint &_parent, &_child;
-
-		Link(int link_nr, RevoluteJoint &parent, RevoluteJoint &child) : 
-			link_nr{link_nr},
-			mass{0},
-			_parent(parent),
-			_child(child)
-		{ 	
-		}
-
-		void get_link_pos(Vector3f &start, Vector3f &end){
-			start = _parent.get_pos();
-			end = _child.get_pos();
-		}
-
-};
-
-class RevoluteRobot
-{
-	 // Link 0 is base.
-	 // Link N is attached rigidly to the end-effector.
-	
-	private:
+	protected:
 		SE3mat _g_st_0, _g_mat;
 		const size_t nr_actuated_joints;
-		const size_t JOINT_START, JOINT_END;
+		const size_t JOINT_START{1}, JOINT_END;
 
 	public:
 		std::vector<Link> links;
 		std::vector<RevoluteJoint> joints;
-
-		RevoluteRobot(std::vector<LinkConf> confs, Vector3f tool_kinvek) : 
-			links(), 
+		
+		BaseRobot(size_t N) : 
 			_g_st_0(),
 			_g_mat(),
-			joints(),
-			nr_actuated_joints(confs.size()),
-			JOINT_START{1}, 
-			JOINT_END{confs.size()}
+			nr_actuated_joints(N),
+			JOINT_END{N}
 			{
+			};
+		
+		void set_angles(std::vector<float> angles){
+			// product of expontentials
+			// exp(psi1_hat theta1) ... exp(psiN_hat thetaN) 
+			for(int joint_nr=JOINT_START; joint_nr <= JOINT_END; joint_nr++){	
+				auto theta = angles[joint_nr-1];
+				RevoluteJoint &joint = joints[joint_nr];
+				joint.set_transform(theta);
+				if(joint_nr==1)
+					_g_mat = joint.g();
+				else
+					_g_mat = _g_mat *  joint.g();
+				joint.set_global_transform(_g_mat);
+			}
+		}
+		
+		MatrixXf spatial_jacobian(){
+			size_t N = size();
+ 			MatrixXf J_s(6, N);
+			int col=0;
+			for(int joint_nr=JOINT_START; joint_nr <= JOINT_END; joint_nr++){
+ 				SE3mat g;
+ 				for(int j=JOINT_START; j < joint_nr; j++){
+ 					g = g * joints[j].g();
+ 				}
+ 				J_s.block(0, col, 6, 1) = g.adj(joints[joint_nr].s_unit).flatten();
+				col++;
+ 			}
+			return J_s;
+ 		}
+
+		MatrixXf body_jacobian(){
+			size_t N = size();
+ 			MatrixXf J_b(6, N);
+			int col=0;
+			for(int joint_nr=JOINT_START; joint_nr <= JOINT_END; joint_nr++){
+ 				SE3mat g;
+ 				for(int j=joint_nr; j <= JOINT_END; j++){
+ 					g = g * joints[j].g();
+ 				}
+				g = g * _g_st_0; 
+ 				J_b.block(0, col, 6, 1) = g.adj_inv(joints[joint_nr].s_unit).flatten();
+				col++;
+ 			}
+			return J_b;
+		}
+
+		SE3mat get_end_effector(){
+			 //   Product of exponential formula to get end effector pos.
+			 //   g(theata1, ..., thetaN) = exp(psi1_hat theta1) ... exp(psiN_hat thetaN) * g_st(0) = g_d 
+			return _g_mat * _g_st_0;
+		}
+		
+		SE3mat get_end_effector_intial(){
+			return _g_st_0;
+		}
+
+		int size(){
+			return nr_actuated_joints;
+		}
+
+};
+
+class RevoluteRobot : public BaseRobot
+{
+	 // Link 0 is attaches ground (joint 0) with fist actuated joint (1).
+	 // Link N is attached rigidly to the end-effector.
+	public:
+		RevoluteRobot(std::vector<LinkConf> confs, Vector3f tool_kinvek) : BaseRobot(confs.size())	
+			{
+				// could be improved...
 				// have to add... rotation in kinvec....
 				Vector3f q_abs(0.0f, 0.0f, 0.0f);
 				int link_nr = 0, joint_nr = 1;
@@ -193,53 +142,7 @@ class RevoluteRobot
 				links.push_back(Link(link_nr, joints[joint_nr-1], joints[joint_nr]));
 				_g_st_0.p = q_abs;
 			}
-
-		void set_angles(std::vector<float> angles){
-			// product of expontentials
-			// exp(psi1_hat theta1) ... exp(psiN_hat thetaN) 
-			for(int joint_nr=JOINT_START; joint_nr <= JOINT_END; joint_nr++){	
-				auto theta = angles[joint_nr-1];
-				RevoluteJoint &joint = joints[joint_nr];
-				joint.set_transform(theta);
-				if(joint_nr==1)
-					_g_mat = joint.g();
-				else
-					_g_mat = _g_mat *  joint.g();
-				joint.set_global_transform(_g_mat);
-			}
-		}
-
-		/*  		
-		MatrixXf spatial_jacobian(){
-			// TODO: verify
-			size_t N = size();
- 			MatrixXf J_s(6, N);
-			for(int joint_nr=JOINT_START; joint_nr <= JOINT_END; joint_nr++){
- 				SE3mat g{};
- 				for(int j=1; j<joint_nr; j++){
- 					g = g * joints[j].get_transform();
- 				}
- 				J_s.block(0, joint_nr, N, joint_nr) = g.adj(joints[joint_nr].s_unit).flatten();
- 			}
-			return J_s;
- 		}
-		 */
-
-		SE3mat get_end_effector(){
-			 //   Product of exponential formula to get end effector pos.
-			 //   g(theata1, ..., thetaN) = exp(psi1_hat theta1) ... exp(psiN_hat thetaN) * g_st(0) = g_d 
-			return _g_mat * _g_st_0;
-		}
-		
-		SE3mat get_end_effector_intial(){
-			return _g_st_0;
-		}
-
-		int size(){
-			return links.size();
-		}
 };
-
 
 struct stanfordArmConfs{
 	float Lz1;
@@ -310,3 +213,5 @@ StanfordArmRobot stanford_arm_robot_init_from_confs(stanfordArmConfs confs){
 }
 
 
+// TODO add scara???
+#endif

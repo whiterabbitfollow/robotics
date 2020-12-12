@@ -28,6 +28,13 @@
 
 using namespace Eigen;
 
+enum ROT_AXIS {
+	ROT_X=0,
+	ROT_Y=1,
+	ROT_Z=2
+};
+
+
 class SE3mat;
 class SO3mat;
 class so3mat;
@@ -48,6 +55,28 @@ Vector3f SO3_log(Matrix3f R, float theta){
 		w *= 1/(2 * sin(theta));
 	}
 	return w;
+}
+
+
+Matrix3f SO3_XYZ(ROT_AXIS axis, float angle)
+{
+	Matrix3f R;
+	R.setZero();
+	if(axis == ROT_AXIS::ROT_Z){
+		R << cos(angle), -sin(angle), 0.0f,
+		  	 sin(angle), cos(angle) , 0.0f,
+			 0.0f	   , 0.0f 		, 1.0f; 
+	}else if(axis== ROT_AXIS::ROT_Y){
+		R << cos(angle), 0.0f,  sin(angle),
+		  	 0.0f      , 1.0f,  0.0f	  ,
+			 -sin(angle), 0.0f , cos(angle); 
+	}else
+	{
+		R <<  1.0f,  0.0f      , 0.0f,
+			  0.0f, cos(angle),  -sin(angle),
+			  0.0f, sin(angle) , cos(angle); 
+	}
+	return R;
 }
 
 Matrix3f SO3_exp(Matrix3f w_skew, double theta)
@@ -110,8 +139,8 @@ class SE3mat{
 		
 		Matrix3f R;
 		Vector3f p;
-		SE3mat() : R(), p(0,0,0) {R.setIdentity();}
-		SE3mat(Vector3f trans) : R(), p(trans) {}
+		SE3mat() : R(), p() {R.setIdentity();p.setIdentity();}
+		SE3mat(Vector3f trans) : R(), p(trans) {R.setIdentity();}
 		SE3mat(SO3mat rot, Vector3f trans) : R(rot.R), p(trans) { }
 		SE3mat(Matrix3f rot, Vector3f trans) : R(rot), p(trans) { }
 		SE3mat(Matrix4f T) : R(T.block(0,0,3,3)), p(T.col(3).segment(0, 3)) { }
@@ -154,6 +183,15 @@ class se3mat{
 		Vector3f w, v;
 		
 		se3mat() : w(), v() {}
+		se3mat(ROT_AXIS axis) : w() , v() 
+		{
+			w.setZero();
+			w(axis) = 1;
+			v.setZero();
+		}
+		
+		se3mat(ROT_AXIS axis, Vector3f vel) : se3mat(axis) {v=vel;}; 
+
 		se3mat(Vector3f rot, Vector3f vel) : w(rot) , v(vel) {}
 		SE3mat exp(float angle);
 		VectorXf flatten_twist(){
@@ -175,8 +213,8 @@ class se3mat{
 			return psi_hat;
 		}
 
-		MatrixXf flatten(){
-			MatrixXf psi(6,1);
+		VectorXf flatten(){
+			VectorXf psi(6);
 			psi.block(0, 0, 3, 1) = v;
 			psi.block(3, 0, 3, 1) = w;
 			return psi;
@@ -192,7 +230,7 @@ SE3mat se3mat::exp(float theta){
 se3mat SE3mat::adj(se3mat psi){
 	auto v_prime =  R * psi.v  + so3_from_vec(p) * R * psi.w;
 	auto w_prime = R * psi.w;
- 	return se3mat(v_prime, w_prime);
+ 	return se3mat(w_prime, v_prime);
 }
 
 se3mat SE3mat::adj_inv(se3mat psi){
@@ -212,19 +250,27 @@ class UnitScrew : public se3mat{
 	public:
 		Vector3f l;
 		float h;
-		bool has_rotation;
+		bool has_unit_rotation, has_unit_velocity, has_rotation;
 
 		UnitScrew() : 
 			se3mat(),
 			l(),
 			h{0},
+			has_unit_rotation{false},
+			has_unit_velocity{false},
 			has_rotation{false}
 			{ }
 
-		UnitScrew(Vector3f rot, Vector3f vel) : se3mat(rot, vel), h{0}{
-			has_rotation = w.sum()!=0;
-			bool has_unit_rotation = w.norm() == 1;
-			bool has_unit_velocity = v.norm() == 1;
+		UnitScrew(ROT_AXIS axis) : se3mat(axis) { }
+		UnitScrew(ROT_AXIS axis, Vector3f vel) : se3mat(axis, vel) { }
+
+		UnitScrew(Vector3f rot, Vector3f vel) :
+			se3mat(rot, vel), 
+			h{0},
+			has_unit_rotation{w.norm() == 1},
+			has_unit_velocity{v.norm() == 1},
+			has_rotation{rot.cwiseAbs().sum() != 0}
+		{
 			if(has_rotation){
 				float w_norm_sq = w.dot(w);
 				h = w.dot(v) / w_norm_sq;
@@ -237,7 +283,21 @@ class UnitScrew : public se3mat{
 		}
 
 		SE3mat exp(float angle){
-			return get_unit_twist().exp(angle);
+			if(has_unit_rotation){
+				Matrix3f w_skew = so3_from_vec(w);
+				Matrix3f w_skew_pow2 = w_skew * w_skew;
+				// Rodriguez formula
+				Matrix3f R = Matrix3f::Identity() + sin(angle) * w_skew + (1-cos(angle)) * w_skew_pow2;
+				// G(angle) * v
+				Vector3f p = (Matrix3f::Identity() * angle + (1-cos(angle)) * w_skew + (angle-sin(angle)) * w_skew_pow2) * v;
+				return SE3mat(R, p);
+			}
+			else if(has_rotation){
+				return get_unit_twist().exp(angle);
+			}
+			else{
+				return SE3mat(Matrix3f::Identity(), v * angle);
+			}
 		}
 
 		void set_from_revolute_axis(Vector3f rot_unit, Vector3f q){
@@ -248,10 +308,10 @@ class UnitScrew : public se3mat{
 			h = 0;
 			l = q;
 			has_rotation = true;
+			has_unit_rotation= true;
 		}
 		
 		se3mat get_unit_twist(){
-			// TODO: necessary??? 
 			Vector3f v_out, w_out;
 			if(has_rotation){
 				v_out = -w.cross(l) + h * w;
@@ -284,7 +344,6 @@ SO3mat SO3mat::inv(){
 so3mat SO3mat::log(){
 	auto theta = SO3_log_theta(R);
 	Vector3f w = SO3_log(R, theta);
-	// TODO: what with theta???
 	return so3mat(w);
 }
 
